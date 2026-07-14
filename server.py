@@ -826,7 +826,7 @@ RISKY_SURFACE = (r"money|spend|billing|payment|ads?\b|production|prod\b|deploy|"
                  r"delete|outbound|send(ing)? (email|dm|message)|publish|post(ing)? to|"
                  r"customer[- ]facing|account (change|settings)")
 GATE_WORDS = r"approval|approve|human|gate|review before|confirm|sign[- ]?off|draft(s)? (for|only)|pause"
-VANITY = r"100k|100,000|million|\b1m\b|go viral|blow up|famous|10x (followers|traffic)\b"
+VANITY = r"100k|100,000|million|\b1m\b|go(es|ing)? viral|blow (up|it up)|famous|10x (followers|traffic)\b"
 
 CRITIQUE_CHECKS = [
     ("verifier", "Has a verification check",
