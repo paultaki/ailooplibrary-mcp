@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.paultaki/ailooplibrary-mcp",
+  "description": "Read-only library of 68+ bounded, verifiable AI agent work loops: browse a compact catalog digest, shortlist loops for a goal with an honest confidence signal, render executable run protocols with stop conditions and state files, lint loop designs against an anti-pattern rubric, and scaffold new loop specs.",
+  "repository": {
+    "url": "https://github.com/paultaki/ailooplibrary-mcp",
+    "source": "github"
+  },
+  "version": "2.0.0",
+  "websiteUrl": "https://ailooplibrary.com/for-agents/",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "ai-loop-library-mcp",
+      "version": "2.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "AI_LOOP_LIBRARY_CATALOG_URL",
+          "description": "Catalog source override (defaults to https://ailooplibrary.com/catalog.json)",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}
