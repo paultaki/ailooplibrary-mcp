@@ -48,12 +48,14 @@ import time
 import urllib.request
 
 SERVER_NAME = "ai-loop-library"
-SERVER_VERSION = "2.0.0"
+SERVER_VERSION = "2.1.0"
 DEFAULT_CATALOG_URL = "https://ailooplibrary.com/catalog.json"
 BASE_URL = "https://ailooplibrary.com"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 LATEST_PROTOCOL = "2025-06-18"
 CACHE_TTL_SECONDS = 300
+RETRY_SECONDS = 60
+MAX_CATALOG_BYTES = 4 * 1024 * 1024
 
 STOPWORDS = {
     "a", "an", "and", "the", "for", "of", "to", "in", "on", "with", "my",
@@ -340,6 +342,9 @@ class Catalog(object):
         self._loaded_at = 0.0
         self._idf = {}
         self._field_tokens = {}
+        self._retry_at = 0.0
+        self._stale = False
+        self._config = None
 
     def _repo_candidates(self):
         here = os.path.dirname(os.path.abspath(__file__))
@@ -349,16 +354,47 @@ class Catalog(object):
                 os.path.join(root, "data", "loops.json")]
 
     def _ingest(self, payload, source):
-        if isinstance(payload, dict):
-            raw_loops = payload.get("loops", [])
-            self._meta = {k: v for k, v in payload.items() if k != "loops"}
-        else:
-            raw_loops = payload
-            self._meta = {}
-        self._loops = [_normalize_loop(item) for item in raw_loops]
+        # Validate and index a candidate before replacing the last usable snapshot.
+        raw_loops = payload.get("loops") if isinstance(payload, dict) else payload
+        if not isinstance(raw_loops, list) or not raw_loops:
+            raise ValueError("Catalog must contain a nonempty loops array")
+        loops = []
+        seen = set()
+        list_fields = {"tags", "steps", "allowed_actions", "tools"}
+        text_fields = {"id", "title", "name", "url", "category", "difficulty",
+                       "trigger", "cadence", "use_when", "useWhen", "summary",
+                       "objective", "verification", "stop_condition", "budget",
+                       "approval_boundary", "safe_output", "prompt", "source",
+                       "state_file_suggestion"}
+        for raw in raw_loops:
+            if not isinstance(raw, dict):
+                raise ValueError("Each catalog loop must be an object")
+            for field in list_fields:
+                if field in raw and (not isinstance(raw[field], list) or
+                                    not all(isinstance(v, str) for v in raw[field])):
+                    raise ValueError("Catalog %s must be an array of strings" % field)
+            for field in text_fields:
+                if field in raw and not isinstance(raw[field], str):
+                    raise ValueError("Catalog %s must be a string" % field)
+            loop = _normalize_loop(raw)
+            if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", loop["id"]):
+                raise ValueError("Catalog loop has an invalid id")
+            if loop["id"] in seen:
+                raise ValueError("Catalog loop ids must be unique")
+            seen.add(loop["id"])
+            loops.append(loop)
+        candidate = Catalog(allow_network=False)
+        candidate._loops = loops
+        candidate._build_index()
+        self._loops = loops
+        self._idf = candidate._idf
+        self._field_tokens = candidate._field_tokens
+        self._meta = ({k: v for k, v in payload.items() if k != "loops"}
+                      if isinstance(payload, dict) else {})
         self._source = source
         self._loaded_at = time.time()
-        self._build_index()
+        self._retry_at = 0.0
+        self._stale = False
         log("loaded %d loops from %s" % (len(self._loops), source))
 
     def _build_index(self):
@@ -384,35 +420,62 @@ class Catalog(object):
         return self._field_tokens.get(loop["id"], {})
 
     def load(self, force=False):
-        if self._loops and not force and time.time() - self._loaded_at < CACHE_TTL_SECONDS:
-            return
         path = os.environ.get("AI_LOOP_LIBRARY_CATALOG_PATH")
+        url = os.environ.get("AI_LOOP_LIBRARY_CATALOG_URL", DEFAULT_CATALOG_URL)
+        config = (path, url)
+        if self._config is not None and config != self._config:
+            # Never reuse a snapshot from a different operator-selected source.
+            self._loops = []
+            self._meta = {}
+            self._source = ""
+            self._stale = False
+            self._retry_at = 0.0
+        self._config = config
+        now = time.time()
+        if self._loops and not force and (
+                now - self._loaded_at < CACHE_TTL_SECONDS or now < self._retry_at):
+            return
         if path:
+            # An explicit local path is authoritative; a broken path fails loudly.
             with open(path, "r", encoding="utf-8") as handle:
                 self._ingest(json.load(handle), path)
             return
         if self.allow_network:
-            url = os.environ.get("AI_LOOP_LIBRARY_CATALOG_URL", DEFAULT_CATALOG_URL)
             try:
                 request = urllib.request.Request(
                     url, headers={"User-Agent": "%s-mcp/%s" % (SERVER_NAME, SERVER_VERSION)})
                 with urllib.request.urlopen(request, timeout=10) as response:
-                    self._ingest(json.loads(response.read().decode("utf-8")), url)
+                    data = response.read(MAX_CATALOG_BYTES + 1)
+                    if len(data) > MAX_CATALOG_BYTES:
+                        raise ValueError("Catalog exceeds the 4 MiB size limit")
+                    self._ingest(json.loads(data.decode("utf-8")), url)
                 return
-            except Exception as exc:  # fall back to local files
+            except Exception as exc:
                 log("catalog fetch failed (%s); trying local fallback" % exc)
         for candidate in self._repo_candidates():
             if os.path.exists(candidate):
-                with open(candidate, "r", encoding="utf-8") as handle:
-                    self._ingest(json.load(handle), candidate)
-                return
-        if not self.allow_network:  # offline self-test on a standalone download
-            log("no local catalog found; using embedded %d-loop sample" % len(EMBEDDED_SAMPLE))
+                try:
+                    with open(candidate, "r", encoding="utf-8") as handle:
+                        self._ingest(json.load(handle), candidate)
+                    return
+                except (OSError, ValueError, TypeError) as exc:
+                    log("local fallback failed (%s)" % exc)
+        if self._loops:
+            self._stale = True
+            self._retry_at = time.time() + RETRY_SECONDS
+            log("using last validated catalog; retrying in %d seconds" % RETRY_SECONDS)
+            return
+        if not self.allow_network:
             self._ingest(EMBEDDED_SAMPLE, "embedded-sample")
             return
         raise RuntimeError(
             "No catalog available. Set AI_LOOP_LIBRARY_CATALOG_PATH or "
             "AI_LOOP_LIBRARY_CATALOG_URL, or run from a clone of the site repo.")
+
+    def cache_status(self):
+        return {"stale": self._stale, "source": self._source,
+                "age_seconds": max(0, int(time.time() - self._loaded_at))
+                if self._loops else 0}
 
     @property
     def loops(self):
@@ -751,6 +814,19 @@ def tool_render_run_protocol(catalog, id_or_slug, goal=None, risk_posture="defau
             % (loop["title"], loop["url"], goal or loop["summary"], loop["verification"],
                state_dir, state_dir, max_rounds))
 
+    if loop["stop_condition"] != DEFAULTS["stop_condition"]:
+        stops += "\n6. Catalog-specific stop condition: " + loop["stop_condition"]
+    approval_rules = """- **Green: proceed:** local edits, drafts, analysis, reading, tests in a sandbox.
+- **Yellow: pause and show a human:** public-facing drafts, PRs to shared branches,
+  config or schema changes, anything a teammate will see before you do.
+- **Red: never without explicit approval:** money, production, outbound messages,
+  deletion, account changes, legal/reputational commitments.
+
+%s%s""" % (loop["approval_boundary"], strict_note)
+    # Copying the short prompt must preserve every stop and approval constraint.
+    paste_prompt += "\n\nStop conditions:\n" + stops
+    paste_prompt += "\n\nApproval boundary:\n" + approval_rules
+
     protocol = """# Run protocol — %(title)s
 
 Canonical spec: %(url)s
@@ -785,13 +861,7 @@ Stop — and report — when any of these is true:
 
 ## Approval boundary (risk colors)
 
-- **Green — proceed:** local edits, drafts, analysis, reading, tests in a sandbox.
-- **Yellow — pause and show a human:** public-facing drafts, PRs to shared branches,
-  config or schema changes, anything a teammate will see before you do.
-- **Red — never without explicit approval:** money, production, outbound messages,
-  deletion, account changes, legal/reputational commitments.
-
-%(approval_boundary)s%(strict_note)s
+%(approval_rules)s
 
 ## Proof format
 
@@ -811,7 +881,7 @@ human decision (approve / redirect / stop).
         "goal_line": goal_line, "steps": steps, "tools_line": tools_line,
         "rules": rules, "state_block": state_block, "state_json": state_json,
         "stops": stops, "approval_boundary": loop["approval_boundary"],
-        "strict_note": strict_note, "paste_prompt": paste_prompt,
+        "approval_rules": approval_rules, "paste_prompt": paste_prompt,
         "unit": unit, "units": unit + "s",
     }
     return protocol
@@ -825,7 +895,46 @@ VIBES_ONLY = r"looks good|feels (good|right|better)|high quality|until (it'?s|it
 RISKY_SURFACE = (r"money|spend|billing|payment|ads?\b|production|prod\b|deploy|"
                  r"delete|outbound|send(ing)? (email|dm|message)|publish|post(ing)? to|"
                  r"customer[- ]facing|account (change|settings)")
-GATE_WORDS = r"approval|approve|human|gate|review before|confirm|sign[- ]?off|draft(s)? (for|only)|pause"
+GATE_WORDS = (r"(?:human|explicit|manual) (?:approval|sign[- ]?off) "
+              r"(?:is )?(?:required|before)|"
+              r"(?:approval|review|confirmation) (?:required|before)|"
+              r"(?:require|await|obtain|request|seek) (?:human |explicit )?approval|"
+              r"only after (?:human |explicit )?approval|"
+              r"(?:drafts? only|drafts? for (?:human )?review)")
+NEGATION = (r"\b(?:without|no|not|never|unnecessary|optional|"
+            r"skip(?:s|ped|ping)?|bypass(?:es|ed|ing)?|ignor(?:e|es|ed|ing)|"
+            r"waiv(?:e|es|ed|ing)|disabl(?:e|es|ed|ing)|remov(?:e|es|ed|ing))\b")
+
+
+def _negated_signal(text, signal):
+    """Conservative lint: a negated signal in either direction needs clarification.
+    Shared by approval and objective checks so inflections cannot diverge.
+    """
+    text = re.sub(r"\b\w+n['’]t\b", "not", text)
+    text = re.sub(r"\bno more than\b", "at most", text)
+    text = re.sub(r"\bno (errors?|failures?)\b", r"zero \1", text)
+    text = re.sub(r"\bno exceptions\b", "", text)
+    # A prohibition in a neighboring clause must not negate a valid signal.
+    clauses = re.split(r"[,.;\n]|\b(?:and|or|but)\b", text)
+    for clause in clauses:
+        if (re.search(NEGATION + r".{0,80}(?:" + signal + ")", clause) or
+                re.search("(?:" + signal + r").{0,40}" + NEGATION, clause)):
+            return True
+    return False
+
+
+def _has_approval_gate(text):
+    # Normalize contractions before inspecting negation. Conservative misses are
+    # preferable to accepting a bare mention of approval as an actual gate.
+    text = re.sub(r"\b\w+n['’]t\b", "not", text)
+    # Allow the explicit prohibition, but never treat bypass language as a gate.
+    text = re.sub(r"(?:never|do not|not) (?:publish|deploy|send|delete|spend)"
+                  r"(?: (?:emails?|messages?|posts?|money|files?))? "
+                  r"without (?:human |explicit )?(?:approval|review|confirmation|sign[- ]?off)",
+                  "human approval required", text)
+    return bool(re.search(GATE_WORDS, text)) and not _negated_signal(
+        text, r"\b(?:approvals?|review(?:s|ed|ers?)?|confirmations?|sign[- ]?offs?)\b")
+
 VANITY = r"100k|100,000|million|\b1m\b|go(es|ing)? viral|blow (up|it up)|famous|10x (followers|traffic)\b"
 
 CRITIQUE_CHECKS = [
@@ -878,19 +987,24 @@ def tool_critique_loop(catalog, loop_description):
         raise ValueError("Describe the loop in a sentence or three (objective, trigger, "
                          "action, verification, stop) so there is something to lint.")
     low = text.lower()
-    has_numbers = bool(re.search(r"\d|percent|%", low))
+    objective_check = bool(re.search(
+        r"\btests? pass\b|\bci (?:is )?green\b|\b(?:zero|0) (?:errors|failures)\b|"
+        r"\b(?:p95|p50|latency|coverage|error rate|pass rate|queue size|scores?)\b"
+        r"[^.;\n]{0,40}(?:under|below|above|at least|at most|[<>])\s*\d|"
+        r"\brubrics?\b", low)) and not _negated_signal(
+            low, r"\b(?:tests?|ci|errors?|failures?|p95|p50|latency|coverage|"
+                 r"error rate|pass rate|queue size|scores?|rubrics?)\b")
     findings = []
     passes = 0
     for check_id, label, pattern, fix in CRITIQUE_CHECKS:
         if check_id == "deterministic_verifier":
             vibes = bool(re.search(VIBES_ONLY, low))
-            passed = has_numbers and not vibes or bool(
-                re.search(r"tests? pass|ci (is )?green|rubric", low))
+            passed = objective_check and not vibes
         elif check_id == "mvl":
             passed = not re.search(VANITY, low)
         elif check_id == "risk_gate":
             risky = bool(re.search(RISKY_SURFACE, low))
-            passed = (not risky) or bool(re.search(GATE_WORDS, low))
+            passed = (not risky) or _has_approval_gate(low)
         else:
             passed = bool(re.search(pattern, low))
         if passed:
@@ -902,7 +1016,13 @@ def tool_critique_loop(catalog, loop_description):
             "fix": None if passed else fix,
         })
     score = "%d/10" % passes
-    if passes >= 8:
+    critical_missing = [f["check"] for f in findings
+                        if f["check"] in ("risk_gate", "verifier", "deterministic_verifier",
+                                          "stop_condition", "budget")
+                        and f["status"] == "missing"]
+    if critical_missing:
+        grade = "needs revision: critical checks not established (%s)" % ", ".join(critical_missing)
+    elif passes >= 8:
         grade = "solid — bounded and verifiable"
     elif passes >= 5:
         grade = "workable, but it will thrash without the missing pieces"
@@ -912,13 +1032,14 @@ def tool_critique_loop(catalog, loop_description):
     return {
         "score": score,
         "grade": grade,
+        "critical_missing": critical_missing,
         "verdict": "Loop lint: %s — %s. Rubric: %s/for-agents/" % (score, grade, BASE_URL),
         "findings": findings,
         "related_catalog_loops": related,
         "method": ("deterministic lint against the AI Loop Library anti-pattern rubric "
                    "(trigger, objective verifier, one-change-per-round, state, stop, "
                    "budget, MVL, risk gates). Text matching, not a model — treat "
-                   "'missing' as 'not stated', and re-run after stating it."),
+                   "'pass' as a text signal, never a safety guarantee. 'missing' means not established; re-run after clarifying it."),
     }
 
 
@@ -927,25 +1048,25 @@ def tool_critique_loop(catalog, loop_description):
 # ---------------------------------------------------------------------------
 
 VERIFIER_SUGGESTIONS = [
-    (r"seo|rank|geo|citation|visibility|search",
+    (r"seo|rank(?:s|ed|ing|ings)?|geo|citations?|visibility|search(?:es|ing)?",
      "Search Console (or SEO API) position/impressions/clicks for 3–10 listed target "
      "queries, re-read on the same cadence; win/flat/loss vs prior baseline"),
-    (r"ads?|cpa|roas|facebook|campaign",
+    (r"ads?|cpa|roas|facebook|campaigns?",
      "CPA/ROAS per variant at a fixed spend threshold; kill losers, scale winners; "
      "hard spend cap per cycle"),
-    (r"ci\b|pipeline|build",
+    (r"ci|pipelines?|builds?",
      "CI p50/p95 duration for the same workflow, before vs after each change, "
      "without weakening tests"),
-    (r"test|flake|flaky|coverage",
+    (r"tests?|flakes?|flaky|coverage",
      "Pass rate / flake count over N consecutive runs of the same suite"),
-    (r"error|crash|incident|uptime|sentry",
+    (r"errors?|crash(?:es)?|incidents?|uptime|sentry",
      "Count of critical production errors (or uptime %) over the last 24h window"),
-    (r"content|publish|blog|post|newsletter|claims|fact",
+    (r"content|publish(?:ing)?|blogs?|posts?|newsletters?|claims?|facts?",
      "Every checkable claim maps to a source or an explicit flag; zero unsourced "
      "claims at the publish gate"),
-    (r"email|inbox|support|refund|ticket",
+    (r"emails?|inbox(?:es)?|support|refunds?|tickets?",
      "Queue size / median response time / % handled with an explicit decision logged"),
-    (r"slow|speed|load|performance|latency",
+    (r"slow|speed|loads?|downloads?|performance|latency",
      "p95 load time (or first-load bytes) for the same pages under fixed conditions"),
 ]
 
@@ -959,7 +1080,7 @@ def tool_design_loop(catalog, goal, constraints=None, cadence=None, context=None
     low = " ".join(filter(None, [goal, constraints or "", context or ""])).lower()
     verifier = "TODO: one command or metric, checked the same way every round"
     for pattern, suggestion in VERIFIER_SUGGESTIONS:
-        if re.search(pattern, low):
+        if re.search(r"\b(?:" + pattern + r")\b", low):
             verifier = suggestion
             break
     trigger = (cadence.strip() if cadence else
@@ -1004,7 +1125,7 @@ Fill every TODO before the first run; a loop with fuzzy fields thrashes.%(constr
 
 ## Next steps
 
-1. Fill the TODOs, then run `critique_loop` on the completed spec — target 8/10+.
+1. Fill the TODOs, then run `critique_loop` on the completed spec — resolve every critical finding; the score alone is not approval.
 2. Dry-run one round manually and inspect the state file before scheduling anything.
 3. If an existing loop above already fits, prefer `render_run_protocol(id, goal)` over
    a custom design.
@@ -1038,6 +1159,7 @@ def tool_catalog_stats(catalog):
         "featured_loops": featured,
         "last_updated": catalog.meta.get("last_updated"),
         "catalog_source": catalog.source,
+        "catalog_status": catalog.cache_status(),
         "site": BASE_URL,
         "library_url": BASE_URL + "/library/",
         "for_agents_url": BASE_URL + "/for-agents/",
@@ -1199,8 +1321,72 @@ TOOL_DEFINITIONS = [
 ]
 
 
+# Structured outputs are additive. Text JSON remains for older MCP clients.
+STRING = {"type": "string"}
+LOOP_SCHEMA = {"type": "object", "required": ["id", "title", "category", "url", "summary"],
+               "properties": {k: STRING for k in ("id", "title", "category", "url", "summary")}}
+OUTPUT_SCHEMAS = {
+    "search_loops": {"results": {"type": "array", "items": LOOP_SCHEMA}},
+    "get_loop": LOOP_SCHEMA["properties"],
+    "pick_loop_for_goal": {"goal": STRING, "shortlist": {"type": "array", "items": LOOP_SCHEMA},
+                           "confidence": {"type": "string", "enum": ["none", "low", "medium", "high"]}},
+    "critique_loop": {"score": STRING, "grade": STRING, "critical_missing": {"type": "array", "items": STRING},
+                      "findings": {"type": "array", "items": {"type": "object",
+                          "required": ["check", "label", "status", "fix"],
+                          "properties": {"check": STRING, "label": STRING,
+                              "status": {"type": "string", "enum": ["pass", "missing"]},
+                              "fix": {"type": ["string", "null"]}}}}},
+    "list_categories": {"categories": {"type": "array", "items": {"type": "object",
+                          "required": ["category", "loop_count", "library_url"],
+                          "properties": {"category": STRING, "loop_count": {"type": "integer"}, "library_url": STRING}}}},
+    "catalog_stats": {"loop_count": {"type": "integer"}, "category_count": {"type": "integer"},
+                      "catalog_source": STRING, "catalog_status": {"type": "object",
+                          "required": ["stale", "source", "age_seconds"],
+                          "properties": {"stale": {"type": "boolean"}, "source": STRING,
+                                         "age_seconds": {"type": "integer", "minimum": 0}}}},
+}
+for definition in TOOL_DEFINITIONS:
+    definition["inputSchema"]["additionalProperties"] = False
+    properties = OUTPUT_SCHEMAS.get(definition["name"])
+    if properties:
+        definition["outputSchema"] = {"type": "object", "properties": properties,
+                                      "required": list(properties)}
+TOOL_BY_NAME = {tool["name"]: tool for tool in TOOL_DEFINITIONS}
+
+
+class InvalidParams(ValueError):
+    pass
+
+
+def validate_arguments(name, arguments):
+    """Validate the small, flat input schemas without a runtime dependency."""
+    if name not in TOOL_BY_NAME:
+        raise InvalidParams("Unknown tool: %s" % name)
+    if not isinstance(arguments, dict):
+        raise InvalidParams("Tool arguments must be an object")
+    schema = TOOL_BY_NAME[name]["inputSchema"]
+    for field in schema.get("required", []):
+        if field not in arguments:
+            raise InvalidParams("Missing required argument: %s" % field)
+    for field, value in arguments.items():
+        rule = schema["properties"].get(field)
+        if rule is None:
+            raise InvalidParams("Unknown argument: %s" % field)
+        types = rule["type"] if isinstance(rule["type"], list) else [rule["type"]]
+        valid = (("string" in types and isinstance(value, str)) or
+                 ("null" in types and value is None) or
+                 ("integer" in types and type(value) is int))
+        if not valid:
+            raise InvalidParams("Invalid type for argument: %s" % field)
+        if "enum" in rule and value not in rule["enum"]:
+            raise InvalidParams("Invalid value for argument: %s" % field)
+        if type(value) is int and (value < rule.get("minimum", value) or
+                                   value > rule.get("maximum", value)):
+            raise InvalidParams("Argument outside allowed range: %s" % field)
+
+
 def dispatch_tool(catalog, name, arguments):
-    arguments = arguments or {}
+    validate_arguments(name, arguments)
     if name == "browse_catalog":
         return tool_browse_catalog(catalog, arguments.get("category"))
     if name == "search_loops":
@@ -1267,20 +1453,34 @@ def resource_read(catalog, uri):
 # JSON-RPC / MCP plumbing (newline-delimited over stdio)
 # ---------------------------------------------------------------------------
 
-def handle_message(catalog, message):
+def handle_message(catalog, message, protocol_version=LATEST_PROTOCOL):
     """Return a JSON-RPC response dict, or None for notifications."""
-    method = message.get("method")
-    msg_id = message.get("id")
-    params = message.get("params") or {}
+    msg_id = message.get("id") if isinstance(message, dict) else None
+    valid_id = type(msg_id) in (str, int)
 
     def ok(result):
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
     def err(code, text):
-        return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": text}}
+        return {"jsonrpc": "2.0", "id": msg_id if valid_id else None,
+                "error": {"code": code, "message": text}}
+
+    if (not isinstance(message, dict) or message.get("jsonrpc") != "2.0" or
+            not isinstance(message.get("method"), str) or
+            ("id" in message and not valid_id)):
+        return err(-32600, "Invalid JSON-RPC request")
+    # Notifications never produce responses or invoke request handlers.
+    if "id" not in message:
+        return None
+    method = message["method"]
+    params = message.get("params", {})
+    if not isinstance(params, dict):
+        return err(-32602, "params must be an object")
 
     if method == "initialize":
         requested = params.get("protocolVersion", LATEST_PROTOCOL)
+        if not isinstance(requested, str):
+            return err(-32602, "protocolVersion must be a string")
         version = requested if requested in SUPPORTED_PROTOCOLS else LATEST_PROTOCOL
         return ok({
             "protocolVersion": version,
@@ -1305,14 +1505,28 @@ def handle_message(catalog, message):
     if method == "ping":
         return ok({})
     if method == "tools/list":
-        return ok({"tools": TOOL_DEFINITIONS})
+        definitions = TOOL_DEFINITIONS if protocol_version == "2025-06-18" else [
+            {k: v for k, v in tool.items() if k != "outputSchema"} for tool in TOOL_DEFINITIONS]
+        return ok({"tools": definitions})
     if method == "tools/call":
         name = params.get("name", "")
+        if not isinstance(name, str):
+            return err(-32602, "Tool name must be a string")
         try:
-            result = dispatch_tool(catalog, name, params.get("arguments"))
+            result = dispatch_tool(catalog, name, params.get("arguments", {}))
             text = result if isinstance(result, str) else json.dumps(
                 result, ensure_ascii=False, indent=2)
-            return ok({"content": [{"type": "text", "text": text}], "isError": False})
+            response = {"content": [{"type": "text", "text": text}], "isError": False,
+                        "_meta": {"ai-loop-library/catalog": catalog.cache_status()}}
+            if isinstance(result, dict) and protocol_version == "2025-06-18":
+                response["structuredContent"] = result
+            if catalog._stale:
+                response["content"].append({"type": "text", "text":
+                    "Catalog refresh failed. Using the last validated snapshot (%d seconds old); "
+                    "retrying after a 60-second backoff." % catalog.cache_status()["age_seconds"]})
+            return ok(response)
+        except InvalidParams as exc:
+            return err(-32602, str(exc))
         except Exception as exc:
             return ok({"content": [{"type": "text", "text": "Error: %s" % exc}],
                        "isError": True})
@@ -1343,22 +1557,32 @@ def handle_message(catalog, message):
 
 def serve():
     catalog = Catalog(allow_network=True)
+    protocol_version = LATEST_PROTOCOL
     log("serving MCP over stdio (newline-delimited JSON-RPC)")
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
+    for raw_line in sys.stdin.buffer:
+        if not raw_line.strip():
             continue
         try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
+            message = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
             response = {"jsonrpc": "2.0", "id": None,
                         "error": {"code": -32700, "message": "Parse error"}}
             sys.stdout.write(json.dumps(response) + "\n")
             sys.stdout.flush()
             continue
-        response = handle_message(catalog, message)
+        try:
+            response = handle_message(catalog, message, protocol_version)
+        except Exception as exc:
+            log("request failed: %s" % exc)
+            msg_id = message.get("id") if isinstance(message, dict) else None
+            response = ({"jsonrpc": "2.0", "id": msg_id,
+                         "error": {"code": -32603, "message": "Internal error"}}
+                        if type(msg_id) in (int, str) else None)
+        if (isinstance(message, dict) and message.get("method") == "initialize"
+                and response and "result" in response):
+            protocol_version = response["result"]["protocolVersion"]
         if response is not None:
-            sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+            sys.stdout.write(json.dumps(response, ensure_ascii=True) + "\n")
             sys.stdout.flush()
     log("stdin closed; exiting")
 

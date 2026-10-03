@@ -5,6 +5,10 @@ for MCP servers. Everything below needs Paul's accounts — none of it is
 automatable from this repo alone. Keep `server.json` version in lockstep with
 `SERVER_VERSION` in server.py.
 
+Current release: 2.1.0. The live site and GitHub release are the supported distribution
+paths. PyPI returned HTTP 404 during this release; `server.json` remains a submission
+manifest, not evidence of an existing PyPI or official-registry publication.
+
 ## 1. PyPI (prerequisite for the official registry entry)
 
 ```bash
